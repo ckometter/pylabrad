@@ -50,10 +50,10 @@ class ServerProtocol(LabradProtocol):
         self.factory._connectionMade(self)
 
     @inlineCallbacks
-    def requestReceived(self, source, context, request, records):
+    def requestReceived(self, source, context, request, flat_records):
         """Handle incoming requests."""
         try:
-            response = yield self.factory.handleRequest(source, context, records)
+            response = yield self.factory.handleRequest(source, context, flat_records)
             self.sendPacket(source, context, -request, response)
         except Exception, e:
             # this will only happen if there was a problem while sending,
@@ -229,7 +229,7 @@ class LabradServer(ClientFactory):
 
     # request handling
     @inlineCallbacks
-    def handleRequest(self, source, context, records):
+    def handleRequest(self, source, context, flat_records):
         """Handle an incoming request.
 
         If this is a new context, we create a context object and a lock
@@ -255,10 +255,11 @@ class LabradServer(ClientFactory):
         response = []
         try:
             yield self.startRequest(c.data, source)
-            for ID, data in records:
+            for ID, tag, flat_data, endianness in flat_records:
                 c.check() # make sure this context hasn't expired
                 try:
                     setting = self.settings[ID]
+                    data = T.unflatten(flat_data, tag, endianness)
                     result = yield setting.handleRequest(self, c.data, data)
                     response.append((ID, result, setting.returns))
                 except Exception, e:

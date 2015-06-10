@@ -23,9 +23,8 @@ def packetStream(packetHandler, endianness='>'):
             buf += yield 0
         s, buf = buf[:length], buf[length:]
 
-        # unflatten the data
+        # unflatten the record list.  Leave the data flattened
         records = unflattenRecords(s, endianness=endianness)
-
         packetHandler(source, context, request, records)
 
 def unflattenPacket(data, endianness='>'):
@@ -37,13 +36,12 @@ def unflattenPacket(data, endianness='>'):
     return context, request, source, records
 
 def unflattenRecords(data, endianness='>'):
-    """Unflatten a list of records from the data segment of a packet"""
+    """Unflatten a list of records from the data segment of a packet, but leave the data flattened"""
     records = []
     s = T.Buffer(data)
     while len(s):
         ID, tag, data = T.unflatten(s, RECORD_TYPE, endianness)
-        rec = ID, T.unflatten(data, tag, endianness)
-        records.append(rec)
+        records.append((ID, tag, data, endianness))
     return records
 
 def flattenPacket(target, context, request, records, endianness='>'):
@@ -63,7 +61,7 @@ def flattenRecords(records, endianness='>'):
 def flattenRecord(ID, data, types=[], endianness='>'):
     """Flatten a piece of data into a record with datatype and property."""
     if isinstance(data, T.FlatData):
-        s, t = data
+        s, t = data.bytes, data.tag
     else:
         try:
             s, t = T.flatten(data, types, endianness)

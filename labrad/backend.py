@@ -14,7 +14,7 @@ from labrad import constants as C
 from labrad.errors import LoginFailedError
 from labrad.stream import packetStream, flattenPacket, flattenRecords
 from labrad.support import getNodeName, getPassword
-
+from labrad import types as T
 backends = {}
 
 class BaseConnection(object):
@@ -327,8 +327,9 @@ class AsyncoreProtocol(asyncore.dispatcher):
         data = self.recv(4096)
         self.stream.send(data)
 
-    def handleResponse(self, _source, _context, request, records):
+    def handleResponse(self, _source, _context, request, flat_records):
         n = -request # reply has request number negated
+        records = [ (fr[0], T.unflatten(fr[2], fr[1], fr[3])) for fr in flat_records ]
         if n not in self.requests:
             # probably a response for a request that has already
             # timed out.  If a message or incoming request, we
