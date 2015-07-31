@@ -21,9 +21,27 @@ Important constants that show up throughout the code.
 
 import os
 
+def make_bool(value):
+    """Convert a string value from env var or cmdline arg to boolean.
+
+    If passed a boolean, we just return the value directly, which is useful
+    in handling defaults which we can specify as bools.
+    """
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ['true', 't', 'yes', 'y', 'on', '1']:
+        return True
+    elif value.lower() in ['false', 'f', 'no', 'n', 'off', '0']:
+        return False
+    else:
+        raise ValueError('must be true or false')
+
 # defaults for the labrad manager
 MANAGER_ID = 1
 MANAGER_PORT = int(os.environ.get('LABRADPORT', 7682))
+MANAGER_USE_TLS = make_bool(os.environ.get('LABRAD_TLS', False))
+MANAGER_VERIFY_HOST = make_bool(os.environ.get('LABRAD_TLS_VERIFY_HOST', True))
+MANAGER_PORT_TLS = int(os.environ.get('LABRAD_TLS_PORT', 7643))
 MANAGER_HOST = os.environ.get('LABRADHOST', 'localhost')
 PASSWORD = os.environ.get('LABRADPASSWORD', None)
 

@@ -34,7 +34,7 @@ from twisted.python.components import registerAdapter
 from twisted.plugin import IPlugin
 from zope.interface import implements
 
-from labrad import util, constants as C, types as T
+from labrad import constants as C, crypto, types as T, util
 from labrad.decorators import setting
 from labrad.protocol import LabradProtocol
 from labrad.interfaces import ILabradServer, IClientAsync
@@ -353,7 +353,16 @@ class LabradServer(ClientFactory):
         """Login as a server after connecting to LabRAD."""
         try:
             addr = protocol.transport.getPeer()
-            log.msg('connected to %s:%s' % (addr.host, addr.port))
+            log.msg('Connected to {}:{}'.format(addr.host, addr.port))
+            if addr.host != '127.0.0.1':
+                log.msg('Manager is remote. Starting TLS.')
+                host = self._remote_host
+                yield protocol.sendRequest(C.MANAGER_ID, [(1L, ('STARTTLS', host))])
+                protocol.transport.startTLS(crypto.tls_options(host))
+                try:
+                    yield protocol.sendRequest(C.MANAGER_ID, [(2L, 'PING')])
+                except Exception, e:
+                    raise Exception('STARTTLS failed. Check that manager certificates are accepted.')
             self.mgr_host, self.mgr_port = addr.host, addr.port
             name = getattr(self, 'instanceName', self.name)
             yield protocol.loginServer(self._getPassword(), name,

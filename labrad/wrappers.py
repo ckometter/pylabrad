@@ -24,7 +24,7 @@ from twisted.python.components import registerAdapter
 
 from zope.interface import implements
 
-from labrad import constants as C, manager, protocol, types as T
+from labrad import constants as C, crypto, manager, protocol, types as T
 from labrad.interfaces import ILabradProtocol, ILabradManager, IClientAsync
 from labrad.support import indent, mangle, extractKey, MultiDict, PacketRecord, PacketResponse, getPassword, hexdump
 
@@ -390,18 +390,66 @@ class AsyncServerWrapper(object):
         return self._cxn._send(self.ID, *args, **kw)
 
 @inlineCallbacks
-def getConnection(host=C.MANAGER_HOST, port=C.MANAGER_PORT, name="Python Client", password=None):
+def getConnection(host=C.MANAGER_HOST, port=None, name="Python Client", password=None, use_tls=C.MANAGER_USE_TLS):
     """Connect to LabRAD and return a deferred that fires the protocol object."""
-    p = yield protocol.factory.connectTCP(host, port, C.TIMEOUT)
+    if port is None:
+        port = C.MANAGER_PORT_TLS if use_tls else C.MANAGER_PORT
+
+    if use_tls:
+        tls_options = crypto.tls_options(host)
+        try:
+            p = yield protocol.factory.connectSSL(host, port, tls_options, timeout=C.TIMEOUT)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise
+    else:
+        def connect():
+            return protocol.factory.connectTCP(host, port, timeout=C.TIMEOUT)
+
+        @inlineCallbacks
+        def start_tls(p, cert_string=None):
+            resp = yield p.sendRequest(C.MANAGER_ID, [(1L, ('STARTTLS', host))])
+            cert = resp[0][1]
+            p.transport.startTLS(crypto.tls_options(host, cert_string=cert_string))
+            returnValue(cert)
+
+        def ping(protocol):
+            return protocol.sendRequest(C.MANAGER_ID, [(2L, 'PING')])
+
+        p = yield connect()
+        if p.transport.getPeer().host != '127.0.0.1':
+            cert = yield start_tls(p)
+            try:
+                yield ping(p)
+            except Exception:
+                print 'STARTTLS failed due to untrusted server certificate:'
+                print 'SHA1 Fingerprint={}'.format(crypto.fingerprint(cert))
+                print
+                while True:
+                    ans = raw_input("Accept server certificate for host '{}'? "
+                                    "(accept just this [O]nce; [S]ave and always "
+                                    "accept this cert; [R]eject) ".format(host))
+                    if ans.lower() in ['o', 's', 'r']:
+                        break
+                    else:
+                        print 'Invalid input:', ans
+                if ans.lower() == 'r':
+                    raise
+                if ans.lower() == 's':
+                    crypto.save_cert(host, cert)
+                p = yield connect()
+                yield start_tls(p, cert)
+                yield ping(p)
     if password is None:
         password = getPassword()
     yield p.loginClient(password, name)
     returnValue(p)
 
 @inlineCallbacks
-def connectAsync(host=C.MANAGER_HOST, port=C.MANAGER_PORT, name="Python Client", password=None):
+def connectAsync(host=C.MANAGER_HOST, port=None, name="Python Client", password=None, use_tls=C.MANAGER_USE_TLS):
     """Connect to LabRAD and return a deferred that fires the client object."""
-    p = yield getConnection(host, port, name, password)
+    p = yield getConnection(host, port, name, password, use_tls=use_tls)
     cxn = IClientAsync(p)
     yield cxn._init()
     cxn.onDisconnect = p.onDisconnect
