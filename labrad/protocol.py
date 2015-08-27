@@ -28,7 +28,7 @@ from twisted.internet.defer import inlineCallbacks, returnValue
 from twisted.python import failure, log
 from zope.interface import implements
 
-from labrad import constants as C, errors, util
+from labrad import constants as C, crypto, errors, util
 from labrad.interfaces import ILabradProtocol, IMessageContext
 from labrad.stream import packetStream, flattenPacket
 
@@ -297,20 +297,25 @@ class LabradProtocol(protocol.Protocol):
     @inlineCallbacks
     def _doLogin(self, password, *ident):
         """Implements the LabRAD login protocol."""
+
+        srp = crypto.SRP(identity=ident[0], password=password)
+
         # send login packet
-        resp = yield self.sendRequest(C.MANAGER_ID, [])
-        challenge = resp[0][1] # get password challenge
+        resp = yield self.sendRequest(C.MANAGER_ID, [(0L, (srp.identity, srp.A_bytes))])
+        salt, B_bytes = resp[0][1] # get server challenge
 
         # send password response
-        m = hashlib.md5()
-        m.update(challenge)
-        m.update(password)
+        M1 = srp.process_server_challenge(salt, B_bytes)
         try:
-            resp = yield self.sendRequest(C.MANAGER_ID, [(0L, m.digest())])
+            resp = yield self.sendRequest(C.MANAGER_ID, [(0L, M1)])
         except Exception:
             raise errors.LoginFailedError('Incorrect password.')
-        self.password = C.PASSWORD = password # save password, since it worked
-        self.loginMessage = resp[0][1] # get welcome message
+        message, M2 = resp[0][1]
+        srp.process_server_confirmation(M2)
+
+        # save password and login message, since authentication worked
+        self.password = C.PASSWORD = password
+        self.loginMessage = message
 
         # send identification
         try:
