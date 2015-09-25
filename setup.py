@@ -47,4 +47,5 @@ setup(
         'labrad': ['LICENSE.txt'],
         'labrad.node': ['*.ini'],
         },
+    scripts = [],
     )
