@@ -237,5 +237,13 @@ class LabradUnitsTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             None * units.Unit('MHz')
 
+    def test_non_SI(self):
+        units.addNonSI('count', True)
+        x = 5 * units.Unit('kcount')
+        self.assertTrue(x['count'] == 5000.0)
+        self.assertTrue(x.inBaseUnits() == 5000.0*units.Unit('count'))
+        self.assertTrue((x**2).unit == units.Unit('kcount^2'))
+
+
 if __name__ == "__main__":
     unittest.main()
