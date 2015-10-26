@@ -171,6 +171,13 @@ class LabradUnitsTests(unittest.TestCase):
         self.assertTrue((5*ns*5j*GHz) == 25j)
         self.assertTrue((5*ns*5j*GHz).isDimensionless())
 
+    def testAngle(self):
+        rad = units.Unit('rad')
+        self.assertTrue(rad.is_angle)
+        self.assertTrue(rad.isAngle())
+        x = units.Unit('rad*m/s')
+        self.assertFalse(x.is_angle)
+        
     def testInfNan(self):
         ms = units.Unit('ms')
         GHz = units.Unit('GHz')
