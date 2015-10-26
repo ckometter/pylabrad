@@ -244,6 +244,10 @@ class LabradUnitsTests(unittest.TestCase):
         self.assertTrue(x.inBaseUnits() == 5000.0*units.Unit('count'))
         self.assertTrue((x**2).unit == units.Unit('kcount^2'))
 
+    def test_string_unit(self):
+        ts = units.Unit('tshirt/s')
+        self.assertEqual((1*ts)['tshirt/h'], 3600.0)
+
 
 if __name__ == "__main__":
     unittest.main()
