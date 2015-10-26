@@ -656,7 +656,7 @@ class Unit(object):
     @staticmethod
     def _stringUnit(name):
         """Create a unit that has a name, but is outside the usual SI system."""
-        return Unit(NumberDict(), 1., [0]*9, 0, name)
+        return Unit(NumberDict([(name, 1)]), 1., [0]*9, 0, name)
 
     def _init(self, names, factor, powers, offset=0, lex_names=''):
         """
