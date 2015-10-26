@@ -247,7 +247,7 @@ class LabradUnitsTests(unittest.TestCase):
     def test_string_unit(self):
         ts = units.Unit('tshirt/s')
         self.assertEqual((1*ts)['tshirt/h'], 3600.0)
-
+        self.assertEqual(str(ts), 'tshirt/s')
 
 if __name__ == "__main__":
     unittest.main()
