@@ -42,7 +42,7 @@ def unflattenRecords(data, endianness='>'):
     s = T.Buffer(data)
     while len(s):
         ID, tag, data = T.unflatten(s, RECORD_TYPE, endianness)
-        rec = ID, T.unflatten(data, tag, endianness)
+        rec = ID, T.FlatData(data, T.parseTypeTag(tag), endianness)
         records.append(rec)
     return records
 
@@ -53,8 +53,8 @@ def flattenPacket(target, context, request, records, endianness='>'):
     else:
         kw = {'endianness': endianness}
         data = ''.join(flattenRecord(*rec, **kw) for rec in records)
-    return PACKET_TYPE.__flatten__((context, request, target, data),
-        endianness)[0]
+    flat = PACKET_TYPE.flatten((context, request, target, data), endianness)
+    return flat.bytes
 
 def flattenRecords(records, endianness='>'):
     kw = {'endianness': endianness}
@@ -62,13 +62,12 @@ def flattenRecords(records, endianness='>'):
 
 def flattenRecord(ID, data, types=[], endianness='>'):
     """Flatten a piece of data into a record with datatype and property."""
-    if isinstance(data, T.FlatData):
-        s, t = data
-    else:
-        try:
-            s, t = T.flatten(data, types, endianness)
-        except T.FlatteningError as e:
-            e.msg = e.msg + "\nSetting ID %s." % (ID,)
-            raise
-    return RECORD_TYPE.__flatten__((ID, str(t), str(s)), endianness)[0]
+    try:
+        flat = T.flatten(data, types, endianness)
+    except T.FlatteningError as e:
+        e.msg = e.msg + "\nSetting ID %s." % (ID,)
+        raise
+    flat_record = RECORD_TYPE.flatten((ID, str(flat.tag), str(flat.bytes)),
+                                      endianness)
+    return flat_record.bytes
 

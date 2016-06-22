@@ -19,11 +19,14 @@ labrad.client
 Contains a blocking client connection to labrad.
 """
 
+import warnings
+
 from labrad import constants as C, types as T
-from labrad.backend import ManagerService, Future
+from labrad.backend import ManagerService
+from labrad.concurrent import map_future, MutableFuture
 from labrad.errors import Error
-from labrad.support import mangle, indent, PrettyMultiDict, PacketRecord, PacketResponse, hexdump
-import traceback
+from labrad.support import (mangle, indent, PrettyMultiDict, FlatPacket,
+                            PacketRecord, PacketResponse, hexdump)
 
 class NotFoundError(Error):
     code = 10
@@ -40,7 +43,12 @@ class SettingWrapper(object):
 
     Information about the setting is loaded on demand and cached.
     You can force a refresh of this information by calling the refresh()
-    method.  Calling this object directly will send a request.
+    method. Calling this object directly will send a request and block until
+    the result is available. Calling the .future method will send a request and
+    return a future with which to get the result later.
+
+    The keyword argument unflatten=False will suppress the normal unflattening
+    and return a FlatData object.
     """
     def __init__(self, server, name, pyName, ID):
         self.name = self.__name__ = self._labrad_name = name
@@ -52,6 +60,13 @@ class SettingWrapper(object):
 
     def __call__(self, *args, **kw):
         wait = kw.pop('wait', True)
+        if not wait:
+            warnings.warn("Calling settings with wait=False is deprecated. "
+                          "Use setting.future(...) instead.")
+        f = self.future(*args, **kw)
+        return f.result() if wait else f
+
+    def future(self, *args, **kw):
         wrap = kw.pop('wrap', True)
         tag = kw.pop('tag', None) or self.accepts
         if not len(args):
@@ -59,10 +74,10 @@ class SettingWrapper(object):
         elif len(args) == 1:
             args = args[0]
         flat = T.flatten(args, tag)
-        future = self._server._send([(self.ID, flat)], **kw)
+        f = self._server._send([(self.ID, flat)], **kw)
         if wrap:
-            future.addCallback(lambda resp: resp[0][1])
-        return future.wait() if wait else future
+            f = map_future(f, lambda resp: resp[0][1])
+        return MutableFuture(f)
 
     # data to be loaded on demand
     @property
@@ -262,11 +277,7 @@ class ServerWrapper(HasDynamicAttrs):
         return self._cxn.context()
 
     def packet(self, **kw):
-        sync = kw.pop('sync', False)
-        if sync:
-            return SyncPacketWrapper(self, **kw)
-        else:
-            return PacketWrapper(self, **kw)
+        return PacketWrapper(self, **kw)
 
     def __call__(self, context=None):
         """Create a new server wrapper based on this one but with a new default context."""
@@ -301,64 +312,6 @@ class ServerWrapper(HasDynamicAttrs):
             |%s""") % (self.name, self.ID, self.__doc__,
                        indent(repr(self.settings)))
 
-class SyncPacketWrapper(HasDynamicAttrs):
-    '''
-    This acts like a packet, but requests are made synchronously.
-    '''
-    def __init__(self, server, **kw):
-        HasDynamicAttrs.__init__(self)
-        self._server = server
-        self._packet = []
-        self._context = kw.pop('context', None)
-        self._kw = kw
-        self._response = []
-        self._packet = [] # This is used to store data needed to create a packet response.
-
-    def send(self, wait=True):
-        """Collect the results into a PacketResponse.
-
-        Because all the setting calls are made synchronously, we do not
-        actually need to send anything here. However, we still provide
-        a wait switch which if True will return the PacketResponse wrapped
-        in a (completed) Future.
-        """
-        resp = PacketResponse(self._response, self._server, self._packet)
-        if not wait:
-            f = Future()
-            f.done = True
-            f.result = resp
-            return f
-        else:
-            return resp
-
-    @property
-    def settings(self):
-        self._refresh()
-        return self._attrs
-
-    _staticAttrs = ['settings', 'send']
-
-    def _getAttrs(self):
-        """Grab the list of the server's attributes."""
-        self._server._refresh() # ensure refresh
-        return self._server._slist
-
-    def _wrapAttr(self, _parent, name, pyName, ID):
-        """Wrap a server setting.
-
-        We call setting immediately then store the results to be collected
-        into a packet response when the packet send method is called.
-        """
-        s = self._server.settings[name]
-        def wrapped(*args, **kw):
-            key = kw.pop('key', pyName)
-            tag = kw.pop('tag', None) or s.accepts # data type
-            result = s(*args, **dict(kw, context=self._context)) # If you set a context, it will be overridden
-            rec = PacketRecord(ID=0, data=None, tag=tag, flat=None, key=key)
-            self._packet.append(rec) # Don't store the ID and data.
-            self._response.append((ID, result))
-        return wrapped
-
 
 class PacketWrapper(HasDynamicAttrs):
     """An object to encapsulate a labrad packet to a server."""
@@ -370,18 +323,44 @@ class PacketWrapper(HasDynamicAttrs):
         self._kw = kw
 
     def send(self, wait=True, **kw):
-        """Send this packet to the server."""
+        """Send this packet to the server and wait for the result.
+
+        Using the keyword argument unflatten=False will suppress the
+        default unflattening and return FlatData objects"""
+        if not wait:
+            warnings.warn("Sending packets with wait=False is deprecated. "
+                          "Use packet.send_future(...) instead.")
+        f = self.send_future(**kw)
+        f.result()
+        return f.result() if wait else f
+
+    def send_future(self, **kw):
+        """Send this packet to the server and get the result as a future."""
         records = [(rec.ID, rec.flat) for rec in self._packet]
-        future = self._server._send(records, **dict(self._kw, **kw))
-        future.addCallback(PacketResponse, self._server, self._packet)
-        return future.wait() if wait else future
+        f = self._server._send(records, **dict(self._kw, **kw))
+        f = map_future(f, PacketResponse, self._server, self._packet)
+        return MutableFuture(f)
 
     @property
     def settings(self):
         self._refresh()
         return self._attrs
 
-    _staticAttrs = ['settings', 'send']
+    def to_cluster(self, context=None):
+        """Get a representation of this packet as a flattenable cluster.
+
+        This method returns a representation of this packet as a cluster of
+        (context, name, records), where records is itself a cluster of
+        (setting name, value), one for each setting record in the packet.
+        """
+        if context is None:
+            context = self._kw.get('context', self._server._ctx)
+            if context is None:
+                context = (self._server._cxn.ID, 0)
+        records = tuple((rec.name, rec.flat) for rec in self._packet)
+        return FlatPacket(context, self._server.name, records)
+
+    _staticAttrs = ['settings', 'send', 'send_future', 'to_cluster']
 
     def _getAttrs(self):
         """Grab the list of the server's attributes."""
@@ -398,7 +377,8 @@ class PacketWrapper(HasDynamicAttrs):
             elif len(args) == 1:
                 args = args[0]
             flat = T.flatten(args, tag)
-            rec = PacketRecord(ID=s.ID, data=args, tag=tag, flat=flat, key=key)
+            rec = PacketRecord(ID=s.ID, data=args, tag=tag, flat=flat, key=key,
+                               name=name)
             self._packet.append(rec)
             return self
         return wrapped
@@ -431,7 +411,7 @@ class PacketWrapper(HasDynamicAttrs):
         a possibly truncated repr of the data for this setting.
         """
         key_str = "" if rec.key is None else " (key=%s)" % (rec.key,)
-        prefix = '%s%s: ' % (self._server.settings[rec.ID].name, key_str)
+        prefix = '%s%s: ' % (rec.name, key_str)
         data_str = self._dataStr(str(rec.data)) if short else self._dataRepr(str(rec.data))
         data_str = data_str.replace('\n', '\n' + ' '*len(prefix))
         return prefix + data_str
@@ -482,7 +462,7 @@ class Client(HasDynamicAttrs):
             return []
         return self._mgr.getServersList()
 
-    _staticAttrs = ['servers', 'connect', 'disconnect', 'context']
+    _staticAttrs = ['servers', 'connect', 'disconnect', 'context', 'spawn']
     _wrapAttr = ServerWrapper
 
     @property
@@ -512,15 +492,19 @@ class Client(HasDynamicAttrs):
         return self._backend.connected
 
     def connect(self, host, port=None, timeout=C.TIMEOUT, password=None,
-                tls=C.MANAGER_TLS):
+                tls_mode=C.MANAGER_TLS):
         self._backend.connect(host, port=port, timeout=timeout,
-                              password=password, tls=tls)
+                              password=password, tls_mode=tls_mode)
 
     def disconnect(self):
         self._backend.disconnect()
 
     def context(self):
         return self._backend.context()
+
+    def spawn(self):
+        """Start a new independent connection to the same manager."""
+        return Client(self._backend.spawn())
 
     def _send(self, target, records, *args, **kw):
         """Send a packet over this connection."""

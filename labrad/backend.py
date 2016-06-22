@@ -3,24 +3,26 @@
 Provides a backend connection that underlies the wrapper client object.
 """
 
+from __future__ import absolute_import
+
 import asyncore
 import hashlib
 import socket
-import sys
 import threading
 import Queue
 
-from labrad import constants as C
+from concurrent.futures import Future
+
+from labrad import constants as C, support, types as T
 from labrad.errors import LoginFailedError
 from labrad.stream import packetStream, flattenPacket, flattenRecords
-from labrad.support import getNodeName, getPassword
 
 backends = {}
 
 class BaseConnection(object):
     def __init__(self, name=None):
-        self.name = name or 'Python Client (%s)' % getNodeName()
-        self.connected = False
+        self.name = name or 'Python Client ({})'.format(support.getNodeName())
+        self._connected = threading.Event()
         self._nextContext = 1
 
     def context(self):
@@ -30,18 +32,31 @@ class BaseConnection(object):
         return ctx
 
     def connect(self, host=C.MANAGER_HOST, port=None, timeout=C.TIMEOUT,
-                password=None, tls=C.MANAGER_TLS):
+                password=None, tls_mode=C.MANAGER_TLS):
         self.host = host
         self.port = port
-        self.ID = self._connect(password, timeout, tls=tls)
-        self.connected = True
+        self.timeout = timeout
+        self.tls_mode = tls_mode
+        self.password = password
+        self.ID = self._connect(password, timeout, tls_mode=tls_mode)
+
+    @property
+    def connected(self):
+        return self._connected.is_set()
 
     def disconnect(self):
         if self.connected:
             self._disconnect()
-            self.connected = False
 
-    def _connect(self, password=None, timeout=None, tls=C.MANAGER_TLS):
+    def spawn(self):
+        """Start a new independent backend connection to the same manager."""
+        cls = self.__class__
+        inst = cls(name=self.name)
+        inst.connect(host=self.host, port=self.port, timeout=self.timeout,
+                     password=self.password, tls_mode=self.tls_mode)
+        return inst
+
+    def _connect(self, password=None, timeout=None, tls_mode=C.MANAGER_TLS):
         """Implemented by subclass"""
 
     def _disconnect(self):
@@ -53,6 +68,7 @@ class BaseConnection(object):
     def sendMessage(self, target, records, *args, **kw):
         """Implemented by subclass"""
 
+
 try:
     from twisted.internet import defer, reactor
 
@@ -60,21 +76,44 @@ try:
     from labrad.wrappers import getConnection
 
     class TwistedConnection(BaseConnection):
-        def _connect(self, password, _timeout, tls):
+        def _connect(self, password, _timeout, tls_mode):
+            @defer.inlineCallbacks
+            def _connect_deferred():
+                cxn = yield getConnection(self.host, self.port, self.name,
+                                          password, tls_mode=tls_mode)
+                self._connected.set()
+
+                # Setup a coroutine that will clear the connected flag when the
+                # connection is lost. We launch this but do not yield to wait
+                # for the result because we want this to happen asynchronously
+                # in the background.
+                @defer.inlineCallbacks
+                def handle_disconnect():
+                    try:
+                        yield cxn.onDisconnect()
+                    except Exception:
+                        pass
+                    self._connected.clear()
+                handle_disconnect()
+
+                defer.returnValue(cxn)
             startReactor()
-            self.cxn = self.call(getConnection, self.host, self.port, self.name,
-                                 password, tls=tls).wait()
+            self.cxn = self.call(_connect_deferred).result()
             return self.cxn.ID
 
         def _disconnect(self):
-            self.call(self.cxn.disconnect).wait()
+            self.call(self.cxn.disconnect).result()
 
         def call(self, func, *args, **kw):
+            """Run func in the twisted reactor; return result as a future."""
             f = Future()
+            @defer.inlineCallbacks
             def wrapped():
-                d = defer.maybeDeferred(func, *args, **kw)
-                d.addCallbacks(lambda result: f.callback(result),
-                               lambda failure: f.errback(failure))
+                try:
+                    result = yield defer.maybeDeferred(func, *args, **kw)
+                    f.set_result(result)
+                except Exception as e:
+                    f.set_exception(e)
             reactor.callFromThread(wrapped)
             return f
 
@@ -82,7 +121,7 @@ try:
             return self.call(self.cxn.sendRequest, target, records, *args, **kw)
 
         def sendMessage(self, target, records, *args, **kw):
-            return self.call(self.cxn.sendMessage, target, records, *args, **kw).wait()
+            return self.call(self.cxn.sendMessage, target, records, *args, **kw).result()
 
     backends['twisted'] = TwistedConnection
 
@@ -91,28 +130,32 @@ except ImportError:
 
 
 class AsyncoreConnection(BaseConnection):
-    def _connect(self, password, timeout, tls):
-        if tls.lower() == 'on':
+    def _connect(self, password, timeout, tls_mode):
+        tls_mode = C.check_tls_mode(tls_mode)
+        if tls_mode == 'on':
             raise Exception('TLS is not currently supported with the asyncore '
                             'backend')
-        self.connected = False
         self.serverCache = {}
         self.settingCache = {}
         if self.port is None:
-            port = C.MANAGER_PORT_TLS if tls.lower() == 'on' else C.MANAGER_PORT
+            port = C.MANAGER_PORT_TLS if tls_mode == 'on' else C.MANAGER_PORT
         else:
             port = self.port
         try:
             sock = socket.create_connection((self.host, port),
                                             timeout or 5)
             socketMap = {}
-            self.cxn = AsyncoreProtocol(sock, map=socketMap)
+            self.cxn = AsyncoreProtocol(sock,
+                                        connected=self._connected,
+                                        map=socketMap)
             self.loop = threading.Thread(target=asyncore.loop,
                 kwargs={'timeout':0.01, 'map': socketMap})
             self.loop.daemon = True
             self.loop.start()
             try:
-                return self.login(password, self.name)
+                ID = self.login(password, self.name)
+                self._connected.set()
+                return ID
             except Exception, e:
                 self.disconnect()
                 raise
@@ -127,24 +170,26 @@ class AsyncoreConnection(BaseConnection):
 
     def login(self, password, *ident):
         # send login packet
-        resp = self.sendRequest(C.MANAGER_ID, []).wait()
+        resp = self.sendRequest(C.MANAGER_ID, []).result()
         challenge = resp[0][1] # get password challenge
 
         # send password response
         if password is None:
-            password = getPassword()
+            password = support.get_password(self.host, self.port)
         m = hashlib.md5()
         m.update(challenge)
         m.update(password)
         try:
-            resp = self.sendRequest(C.MANAGER_ID, [(0L, m.digest())]).wait()
+            resp = self.sendRequest(C.MANAGER_ID, [(0L, m.digest())]).result()
         except Exception:
             raise LoginFailedError('Incorrect password.')
+        support.cache_password(self.host, self.port, password)
+        self.password = password
         self.loginMessage = resp[0][1] # get welcome message
 
         # send identification
         try:
-            resp = self.sendRequest(C.MANAGER_ID, [(0L, (1L,) + ident)]).wait()
+            resp = self.sendRequest(C.MANAGER_ID, [(0L, (1L,) + ident)]).result()
         except Exception:
             raise LoginFailedError('Bad identification.')
         return resp[0][1] # get assigned ID
@@ -238,11 +283,12 @@ backends['asyncore'] = AsyncoreConnection
 class AsyncoreProtocol(asyncore.dispatcher):
     """Receive and send labrad packets."""
 
-    def __init__(self, socket, **kw):
+    def __init__(self, socket, connected, **kw):
         asyncore.dispatcher.__init__(self, socket, **kw)
 
+        self.connected = connected
         self.alive = True
-        self.lock = threading.Condition()
+        self.lock = threading.Lock()
         self.nextRequest = 1
         self.requests = {}
         self.pool = set()
@@ -255,13 +301,10 @@ class AsyncoreProtocol(asyncore.dispatcher):
 
     def enqueue(self, target, context, flatrecs, future):
         """Called from another thread to enqueue a packet"""
-        self.lock.acquire()
-        try:
+        with self.lock:
             if not self.alive:
                 raise Exception('not connected')
             self.queue.put((target, context, flatrecs, future))
-        finally:
-            self.lock.release()
 
     def drop(self):
         self.queue.put(None)
@@ -273,15 +316,15 @@ class AsyncoreProtocol(asyncore.dispatcher):
         self.terminate(Exception('Connection lost'))
 
     def terminate(self, reason):
-        self.lock.acquire()
-        self.alive = False
-        self.lock.release()
+        with self.lock:
+            self.alive = False
+        self.connected.clear()
         try:
             self.close()
         finally:
             self.flushCommands()
             for d in self.requests.values():
-                d.errback(reason)
+                d.set_exception(reason)
 
     def readable(self):
         return True
@@ -336,7 +379,7 @@ class AsyncoreProtocol(asyncore.dispatcher):
         data = self.recv(4096)
         self.stream.send(data)
 
-    def handleResponse(self, _source, _context, request, records):
+    def handleResponse(self, _source, _context, request, flat_records):
         n = -request # reply has request number negated
         if n not in self.requests:
             # probably a response for a request that has already
@@ -346,77 +389,13 @@ class AsyncoreProtocol(asyncore.dispatcher):
         future = self.requests[n]
         del self.requests[n]
         self.pool.add(n)
+        records = [(ID, flat_data.unflatten()) for ID, flat_data in flat_records]
         errors = [r[1] for r in records if isinstance(r[1], Exception)]
         if errors:
             # fail on the first error
-            future.errback(errors[0])
+            future.set_exception(errors[0])
         else:
-            future.callback(records)
-
-
-class Failure(object):
-    def __init__(self, error=None):
-        if error is None:
-            self.exctype, self.value = sys.exc_info()[:2]
-        else:
-            self.exctype, self.value = None, error
-
-    def raiseException(self):
-        if self.exctype is None:
-            raise self.value
-        else:
-            raise self.exctype, self.value
-
-class Future(object):
-
-    def __init__(self):
-        self.ready = Queue.Queue()
-        self.done = False
-        self.result = None
-        self.callbacks = []
-
-    def addCallback(self, f, *args, **kw):
-        if self.done:
-            self.result = f(self.result, *args, **kw)
-        else:
-            self.callbacks.append((f, args, kw))
-        return self
-
-    def callback(self, result):
-        self.result = result
-        self.ready.put(self)
-
-    def errback(self, error=None):
-        if not hasattr(error, 'raiseException'):
-            error = Failure(error)
-        self.result = error
-        self.ready.put(self)
-
-    def wait(self):
-        if self.done:
-            return self.result
-        while True:
-            f = self.ready.get()
-            f.done = True
-            result = f.result
-            if hasattr(result, 'raiseException'):
-                # this can be a Twisted Failure or our
-                # own Failure class, as defined above
-                # If any Future in the queue fails,
-                # we immediately bail.
-                result.raiseException()
-            else:
-                for func, args, kw in f.callbacks:
-                    result = func(result, *args, **kw)
-                f.result = result
-            if f is self:
-                return result
-
-    def __repr__(self):
-        if self.done:
-            return '<Future: result=%r>' % (self.result,)
-        else:
-            return '<Future: pending...>'
+            future.set_result(records)
 
 
 def connect(host=C.MANAGER_HOST, port=None, name=None, backend=None, **kw):
@@ -438,12 +417,12 @@ class ManagerService:
 
     def getServersList(self):
         """Get list of connected servers."""
-        return self._getIDList(C.SERVERS_LIST)
+        return self._getIDList(T.flatten(C.SERVERS_LIST, 'w'))
 
     def getServerInfo(self, serverID):
         """Get information about a server."""
-        packet = [(C.HELP, long(serverID)),
-                  (C.SETTINGS_LIST, long(serverID))]
+        packet = [(C.HELP, T.flatten(serverID, 'w')),
+                  (C.SETTINGS_LIST, T.flatten(serverID, 'w'))]
         resp = self._send(packet)
         descr, notes = resp[0][1]
         settings = self._reorderIDList(resp[1][1])
@@ -451,19 +430,19 @@ class ManagerService:
 
     def getSettingsList(self, serverID):
         """Get list of settings for a server."""
-        return self._getIDList(C.SETTINGS_LIST, serverID)
+        return self._getIDList(C.SETTINGS_LIST, T.flatten(serverID, 'w'))
 
     def getSettingInfo(self, serverID, settingID):
         """Get information about a setting."""
-        packet = [(C.HELP, (long(serverID), long(settingID)))]
+        packet = [(C.HELP, T.flatten((serverID, settingID), 'ww'))]
         resp = self._send(packet)
         description, accepts, returns, notes = resp[0][1]
         return (description, accepts, returns, notes)
 
     def getSettingInfoByName(self, serverID, settingName):
         """Get information about a setting using its name."""
-        packet = [(C.HELP, (long(serverID), settingName)),
-                  (C.LOOKUP, (long(serverID), settingName))]
+        packet = [(C.HELP, T.flatten((serverID, settingName), 'ws')),
+                  (C.LOOKUP, T.flatten((serverID, settingName), 'ws'))]
         resp = self._send(packet)
         description, accepts, returns, notes = resp[0][1]
         ID = resp[1][1][1]
@@ -471,7 +450,7 @@ class ManagerService:
 
     def _send(self, packet, *args, **kw):
         """Send a request to the manager and wait for the result."""
-        return self.cxn.sendRequest(C.MANAGER_ID, packet, *args, **kw).wait()
+        return self.cxn.sendRequest(C.MANAGER_ID, packet, *args, **kw).result()
 
     def _getIDList(self, setting, data=None):
         resp = self._send([(setting, data)])

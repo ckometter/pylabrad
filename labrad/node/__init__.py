@@ -35,8 +35,7 @@ configuration keys are:
                     that contain a file called '.nodeignore' will be skipped,
                     along with all their subdirs.
   extensions (*s): what files to look at, e.g. ['.ini', '.py', '.exe']
-  packages (*s): python packages to be scanned for servers using twisted's
-                 plugin system (this feature is deprecated and will be removed).
+  autostart (*s): list of servers to be autostarted
 
 Changes required on the server:
 
@@ -87,12 +86,10 @@ from twisted.internet.protocol import ProcessProtocol
 from twisted.internet.error import ProcessDone, ProcessTerminated
 from twisted.python import usage
 from twisted.python.runtime import platformType
-from twisted.plugin import getPlugins
-from zope.interface import Interface, implements
 
 import labrad
-from labrad import util, types as T, constants as C
-from labrad.server import ILabradServer, LabradServer, setting
+from labrad import protocol, util, types as T, constants as C
+from labrad.server import LabradServer, setting
 import labrad.support
 from labrad.util import dispatcher, findEnvironmentVars, interpEnvironmentVars
 
@@ -100,13 +97,9 @@ from labrad.util import dispatcher, findEnvironmentVars, interpEnvironmentVars
 LOG_LENGTH = 1000 # maximum number of lines of stdout to keep per server
 
 
-class IServerProcess(Interface):
-    pass
-
-
 class ServerProcess(ProcessProtocol):
     """A class to represent a running server instance."""
-    implements(IServerProcess)
+
     timeout = 20
     shutdownTimeout = 5
 
@@ -389,48 +382,30 @@ def createGenericServerCls(path, filename, conf):
     return cls
 
 
-def createPythonServerCls(plugin):
-    """Create a ServerProcess class representing a python server.
+def version_tuple(version):
+    """Get a tuple from a version string that can be used for comparison.
 
-    Options for this server are read from the python object itself,
-    located with the twisted plugin system.
+    Version strings are typically of the form A.B.C-X where A, B and C
+    are numbers, and X is extra text denoting dev status (e.g. alpha or beta).
+    Given this structure, we cannot just use string comparison to get the order
+    of versions; instead we parse the version into a tuple
+
+    ((int(A), int(B), int(C)), version)
+
+    If we cannot parse the numeric part, we just use the empty tuple for the
+    first entry, and for such tuples the comparison will just fall back to
+    alphabetic comparison on the full versions string.
     """
-    class cls(ServerProcess):
-        pass
-
-    # general information
-    cls.name = plugin.name
-    cls.__doc__ = plugin.__doc__
-    if hasattr(plugin, 'version'):
-        cls.version = plugin.version
-    else:
-        cls.version = '0.0'
-    if hasattr(plugin, 'instanceName'):
-        cls.instancename = plugin.instanceName
-    else:
-        cls.instancename = plugin.name
-    cls.environVars = findEnvironmentVars(cls.instancename)
-    cls.isLocal = len(cls.environVars) > 0
-
-    # startup
-    cls.cmdline = ' '.join([sys.executable, '-m', plugin.__module__])
-    cls.path, cls.filename = os.path.split(sys.modules[plugin.__module__].__file__)
-
-    # shutdown
-    if hasattr(plugin, 'shutdownMessage'):
-        cls.shutdownMode = 'message', plugin.shutdownMessage
-    elif hasattr(plugin, 'shutdownSetting'):
-        cls.shutdownMode = 'setting', plugin.shutdownSetting
+    numstr, _, _extra = version.partition('-')
     try:
-        cls.shutdownTimeout = float(plugin.shutdownTimeout)
-    except:
-        pass
+        nums = tuple(int(n) for n in numstr.split('.'))
+    except Exception:
+        nums = ()
+    return (nums, version)
 
-    return cls
 
-
-class Node(MultiService):
-    """Parent Service that keeps the node running.
+class Node(object):
+    """Parent class that keeps the node running.
 
     If the manager is stopped or we lose the network connection,
     this service attempts to restart it so that we will come
@@ -438,47 +413,41 @@ class Node(MultiService):
     """
     reconnectDelay = 10
 
-    def __init__(self, name, host, port, tls=C.MANAGER_TLS):
-        MultiService.__init__(self)
-        self.name = name
+    def __init__(self, nodename, host, port, password, tls_mode=C.MANAGER_TLS):
+        self.nodename = nodename
         self.host = host
         self.port = port
-        self.tls = tls
+        self.password = password
+        self.tls_mode = tls_mode
 
-    def startService(self):
-        MultiService.startService(self)
-        self.startConnection()
+    @inlineCallbacks
+    def run(self):
+        """Run the node in a loop, reconnecting after connection loss."""
+        log = logging.getLogger('labrad.node')
+        while True:
+            print 'Connecting to {}:{}...'.format(self.host, self.port)
+            try:
+                p = yield protocol.connect(self.host, self.port, self.tls_mode)
+                yield p.authenticate(self.password)
+                node = NodeServer(self.nodename, self.host, self.port,
+                                  self.password)
+                yield node.startup(p)
+            except Exception:
+                log.error('Node failed to start', exc_info=True)
+            else:
+                try:
+                    yield node.onShutdown()
+                except Exception:
+                    log.error('Error during node shutdown', exc_info=True)
 
-    def startConnection(self):
-        """Attempt to start the node and connect to LabRAD."""
-        print 'Connecting to %s:%d...' % (self.host, self.port)
-        node = NodeServer(self.name, self.host, self.port)
-        node.configure_tls(self.host, self.tls)
-        node.onStartup().addErrback(self._error)
-        node.onShutdown().addCallbacks(self._disconnected, self._error)
-        self.cxn = TCPClient(self.host, self.port, node)
-        self.addService(self.cxn)
+            ## hack: manually clear the internal message dispatcher
+            dispatcher.connections.clear()
+            dispatcher.senders.clear()
+            dispatcher._boundMethods.clear()
 
-    def _disconnected(self, data):
-        print 'Node disconnected from manager.'
-        return self._reconnect()
-
-    def _error(self, failure):
-        print failure.getErrorMessage()
-        return self._reconnect()
-
-    def _reconnect(self):
-        """Clean up from the last run and reconnect."""
-        ## hack: manually clearing the dispatcher...
-        dispatcher.connections.clear()
-        dispatcher.senders.clear()
-        dispatcher._boundMethods.clear()
-        ## end hack
-        if hasattr(self, 'cxn'):
-            self.removeService(self.cxn)
-            del self.cxn
-        reactor.callLater(self.reconnectDelay, self.startConnection)
-        print 'Will try to reconnect in %d seconds...' % self.reconnectDelay
+            yield util.wakeupCall(0)
+            print 'Will try to reconnect in {} seconds...'.format(self.reconnectDelay)
+            yield util.wakeupCall(self.reconnectDelay)
 
 
 class NodeConfig(object):
@@ -489,8 +458,6 @@ class NodeConfig(object):
             runnable servers.
         exts (list(string)): a list of file extensions that will be included
             when searching for servers.
-        mods (list(string)): a list of python modules that will be searched for
-            runnable servers using twisted's plugin mechanism. TODO: remove this
         autostart (list(string)): a list of servers that will be automatically
             started when the node launches.
     """
@@ -527,7 +494,7 @@ class NodeConfig(object):
 
         # load defaults (creating them if necessary)
         create = '__default__' not in dirs
-        defaults = ([], ['labrad.servers'], ['.ini', '.py'], [])
+        defaults = ([], ['.ini', '.py'], [])
         defaults = yield self._load('__default__', create, defaults)
 
         # load this node (creating config if necessary)
@@ -547,9 +514,9 @@ class NodeConfig(object):
 
     def _update(self, config, triggerRefresh=True):
         """Update instance variables from loaded config."""
-        self.dirs, self.mods, self.extensions, self.autostart = config
-        print 'config updated: dirs={}, modules={}, extensions={}, autostart={}'.format(
-                self.dirs, self.mods, self.extensions, self.autostart)
+        self.dirs, self.extensions, self.autostart = config
+        print 'config updated: dirs={}, extensions={}, autostart={}'.format(
+                self.dirs, self.extensions, self.autostart)
         if triggerRefresh:
             self.parent.refreshServers()
 
@@ -561,27 +528,23 @@ class NodeConfig(object):
             p.cd(['', 'Nodes', nodename], True)
         if create:
             p.set('directories', defaults[0])
-            p.set('packages', defaults[1])
-            p.set('extensions', defaults[2])
-            p.set('autostart', defaults[3])
+            p.set('extensions', defaults[1])
+            p.set('autostart', defaults[2])
         p.get('directories', '*s', key='dirs')
-        p.get('packages', '*s', key='mods')
         p.get('extensions', '*s', key='exts')
         p.get('autostart', '*s', True, [], key='autostart')
         ans = yield p.send()
         def remove_empties(strs):
             return [s for s in strs if s]
         dirs = remove_empties(ans.dirs)
-        mods = remove_empties(ans.mods)
         exts = remove_empties(ans.exts)
         autostart = sorted(remove_empties(ans.autostart))
-        returnValue((dirs, mods, exts, autostart))
+        returnValue((dirs, exts, autostart))
 
     def _save(self):
         """Save the current configuration to the registry."""
         p = self._packet()
         p.set('directories', self.dirs)
-        p.set('packages', self.mods)
         p.set('extensions', self.extensions)
         return p.send()
 
@@ -617,12 +580,13 @@ class NodeServer(LabradServer):
 
     name = 'node %LABRADNODE%'
 
-    def __init__(self, nodename, host, port):
+    def __init__(self, nodename, host, port, password):
         LabradServer.__init__(self)
         self.nodename = nodename
         self.name = 'node %s' % nodename
         self.host = host
         self.port = port
+        self.password = password
         self.servers = {}
         self.instances = {}
         self.starters = {}
@@ -719,20 +683,13 @@ class NodeServer(LabradServer):
 
     def refreshServers(self):
         """Refresh the list of available servers."""
-        servers = {}
-        # look for python plugins
-        for module in self.config.mods:
-            try:
-                __import__(module)
-                plugins = getPlugins(ILabradServer, sys.modules[module])
-                for plugin in plugins:
-                    s = createPythonServerCls(plugin)
-                    s.client = self.client
-                    if s.name not in servers:
-                        servers[s.name] = s
-            except:
-                logging.error('Error while loading plugins from module "%s":' % module,
-                              exc_info=True)
+        # configs is a nested map from name to version to list of classes.
+        #
+        # This allows us to deal with cases where there are many definitions
+        # for different server versions, and possibly also redundant defitions
+        # for the same version.
+        configs = {}
+
         # look for .ini files
         for dirname in self.config.dirs:
             for path, dirs, files in os.walk(dirname):
@@ -764,13 +721,39 @@ class NodeServer(LabradServer):
                                 continue
                         s = createGenericServerCls(path, f, conf)
                         s.client = self.client
-                        if s.name not in servers:
-                            servers[s.name] = s
-                    except:
+                        if s.name not in configs:
+                            configs[s.name] = {}
+                        versions = configs.setdefault(s.name, {})
+                        classes = versions.setdefault(s.version, [])
+                        classes.append(s)
+                    except Exception:
                         fname = os.path.join(path, f)
                         logging.error('Error while loading config file "%s":' % fname,
                                   exc_info=True)
-        self.servers = servers
+
+        servers_dict = {}
+        for versions in configs.values():
+            for servers in versions.values():
+                if len(servers) > 1:
+                    conflicting_files = [s.filename for s in servers]
+                    s = servers[0]
+                    logging.warning(
+                        'Found redundant server configs with same name and '
+                        'version; will use {}. name={}, version={}, '
+                        'conflicting_files={}'
+                        .format(s.filename, s.name, s.version,
+                                conflicting_files))
+
+            servers = [ss[0] for ss in versions.values()]
+            servers.sort(key=lambda s: version_tuple(s.version))
+            if len(servers) > 1:
+                # modify server name for all but the latest version
+                for s in servers[:-1]:
+                    s.name = '{}-{}'.format(s.name, s.version)
+
+            for s in servers:
+                servers_dict[s.name] = s
+        self.servers = servers_dict
         # send a message with the current server list
         dispatcher.send('status', servers=self.status())
 
@@ -948,8 +931,9 @@ def makeService(options):
     name = options['name']
     host = options['host']
     port = int(options['port'])
-    tls = C.check_tls_mode(options['tls'])
-    return Node(name, host, port, tls)
+    password = labrad.support.get_password(host, port)
+    tls_mode = C.check_tls_mode(options['tls'])
+    return Node(name, host, port, password, tls_mode)
 
 
 def setup_logging(options):
@@ -1000,7 +984,7 @@ def main():
     setup_logging(config)
     logging.getLogger('labrad.node').info('Starting')
     service = makeService(config)
-    service.startService()
+    service.run()
     reactor.run()
 
 if __name__ == '__main__':

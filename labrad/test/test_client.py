@@ -64,9 +64,24 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(resp), 4)
 
         # single setting with delayed response
+        resp = pts.echo.future(TEST_STR)
+        resp = resp.result()
+        self.assertEqual(resp, TEST_STR)
+
+        # allow .wait() for backwards compatibility
+        resp = pts.echo.future(TEST_STR)
+        resp = resp.wait()
+        self.assertEqual(resp, TEST_STR)
+
+        # allow calling with wait=False for backwards compatibility
+        resp = pts.echo(TEST_STR, wait=False)
+        resp = resp.result()
+        self.assertEqual(resp, TEST_STR)
+
         resp = pts.echo(TEST_STR, wait=False)
         resp = resp.wait()
         self.assertEqual(resp, TEST_STR)
+
 
     def testCompoundPacket(self):
         pts = self._get_tester()
@@ -98,6 +113,25 @@ class ClientTests(unittest.TestCase):
         # test packet mutation by key
         pkt2['two'] = TEST_STR
         resp = pkt2.send()
+        self.assertEqual(resp.two, TEST_STR)
+
+        # send packet asynchronously
+        resp = pkt2.send_future()
+        resp = resp.result()
+        self.assertEqual(resp.two, TEST_STR)
+
+        # allow calling .wait() for backwards compatibility
+        resp = pkt2.send_future()
+        resp = resp.wait()
+        self.assertEqual(resp.two, TEST_STR)
+
+        # allow sending with wait=False for backwards compatibility
+        resp = pkt2.send(wait=False)
+        resp = resp.result()
+        self.assertEqual(resp.two, TEST_STR)
+
+        resp = pkt2.send(wait=False)
+        resp = resp.wait()
         self.assertEqual(resp.two, TEST_STR)
 
     def testTupleKeys(self):
@@ -143,3 +177,18 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(pts3.keys(), ['3'])
         self.assertEqual(pts4.keys(), ['4'])
 
+    def test_server_calls(self):
+        """Make sure that server settings can call other settings directly.
+        """
+        cxn = self.cxn()
+
+        ts = cxn.python_test_server
+
+        ts.set_reversed("bar", "foo")
+        self.assertEqual(ts.get("foo"), "bar")
+
+        ts.echo_delay(T.Value(0.1, 's'))
+        self.assertEquals(ts.delayed_echo_wrapper(1), 1)
+
+if __name__ == "__main__":
+    unittest.main()

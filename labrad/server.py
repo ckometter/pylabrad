@@ -20,47 +20,19 @@ Base classes for building asynchronous, context- and request- aware
 servers with labrad.
 """
 
-import getpass
 from datetime import datetime
 from operator import attrgetter
 import traceback
 
-from twisted.application import service, internet
 from twisted.internet import defer, reactor
 from twisted.internet.defer import inlineCallbacks, returnValue
-from twisted.internet.error import ConnectionDone
-from twisted.internet.protocol import ClientFactory
+from twisted.internet.error import ConnectionDone, ConnectionLost
 from twisted.python import failure, log
-from twisted.python.components import registerAdapter
-from twisted.plugin import IPlugin
-from zope.interface import implements
 
-from labrad import constants as C, crypto, types as T, util
+from labrad import constants as C, types as T, util
 from labrad.decorators import setting
-from labrad.protocol import LabradProtocol
-from labrad.interfaces import ILabradServer, IClientAsync
+from labrad.wrappers import ClientAsync
 
-class ServerProtocol(LabradProtocol):
-    """Standard protocol for labrad servers.
-
-    Most of the server-specific customization goes in the factory,
-    not this protocol class.
-    """
-    def connectionMade(self):
-        LabradProtocol.connectionMade(self)
-        self.factory._connectionMade(self)
-
-    @inlineCallbacks
-    def requestReceived(self, source, context, request, records):
-        """Handle incoming requests."""
-        try:
-            response = yield self.factory.handleRequest(source, context, records)
-            self.sendPacket(source, context, -request, response)
-        except Exception as e:
-            # this will only happen if there was a problem while sending,
-            # which usually means a problem flattening the response into
-            # a valid LabRAD packet
-            self.sendPacket(source, context, -request, [(0, e)])
 
 class Signal(object):
     """A Signal object is a simple publish/subscribe messaging primitive.
@@ -206,12 +178,9 @@ class Context(object):
         self.expired = True
 
 
-class LabradServer(ClientFactory):
+class LabradServer(object):
     """A generic LabRAD server."""
 
-    implements(IPlugin, ILabradServer)
-
-    protocol = ServerProtocol
     sendTracebacks = True
     prioritizeWrites = False
 
@@ -228,28 +197,9 @@ class LabradServer(ClientFactory):
         self.signals = []
         self.contexts = {}
 
-    def configure_tls(self, host, tls):
-        """Configure TLS options for this server's connection to labrad.
-
-        Must be called before we actually initiate a network connection, e.g.
-        before this server instance is passed to one of the reactor.connect*
-        methods.
-
-        Args:
-            host (string): The remote hostname of the manager we are connecting
-                to. This will be used to validate the hostname of the
-                certificate presented by the manager.
-            tls (string): One of 'on', 'off' or 'starttls'. Note that if
-                tls == 'on', the connection should be initiated with
-                reactor.connectSSL, while if tls == 'off' or tls == 'starttls'
-                then reactor.connectTCP should be used instead.
-        """
-        self._remote_host = host
-        self._tls_mode = C.check_tls_mode(tls)
-
     # request handling
     @inlineCallbacks
-    def handleRequest(self, source, context, records):
+    def request_handler(self, source, context, flat_records):
         """Handle an incoming request.
 
         If this is a new context, we create a context object and a lock
@@ -275,11 +225,11 @@ class LabradServer(ClientFactory):
         response = []
         try:
             yield self.startRequest(c.data, source)
-            for ID, data in records:
+            for ID, flat_data in flat_records:
                 c.check() # make sure this context hasn't expired
                 try:
                     setting = self.settings[ID]
-                    result = yield setting.handleRequest(self, c.data, data)
+                    result = yield setting.handleRequest(self, c.data, flat_data)
                     response.append((ID, result, setting.returns))
                 except Exception, e:
                     response.append((ID, self._getTraceback(e)))
@@ -366,40 +316,32 @@ class LabradServer(ClientFactory):
         self.signals.remove(signal)
         return self.removeSetting(signal, packet)
 
-    # Network events
-    # these methods are called by network events from twisted
     @inlineCallbacks
-    def _connectionMade(self, protocol):
-        """Login as a server after connecting to LabRAD."""
+    def startup(self, protocol):
+        """Start this server using the given protocol connection.
+
+        Identifies this server to the manager, creates an async wrapper for the
+        protocol connection, and then runs initialization callbacks for this
+        server.
+
+        Args:
+            protocol (labrad.protocol.LabradProtocol): A protocol connection
+                to the labrad manager, as returned by labrad.protocol.connect.
+                This protocol must have been authenticated prior to calling
+                startup.
+
+        Returns:
+            twisted.internet.defer.Deferred(None): A deferred that will fire
+            once startup is complete.
+        """
         try:
-            addr = protocol.transport.getPeer()
-            is_local_connection = util.is_local_connection(protocol.transport)
-            log.msg('Connected to {}:{}'.format(addr.host, addr.port))
-            if ((self._tls_mode == 'starttls-force') or
-                (self._tls_mode == 'starttls' and not is_local_connection)):
-                log.msg('Manager is remote ({}). Starting TLS.'.format(addr.host))
-                host = self._remote_host
-                try:
-                    yield protocol.sendRequest(C.MANAGER_ID, [(1L, ('STARTTLS', host))])
-                except Exception as e:
-                    raise Exception(
-                        'Failed sending STARTTLS command to server. You should '
-                        'update the manager and configure it to support '
-                        'encryption or else disable encryption for clients. See '
-                        'https://github.com/labrad/pylabrad/blob/master/CONFIG.md.'
-                        'Error: {}'.format(e))
-                protocol.transport.startTLS(crypto.tls_options(host))
-                try:
-                    yield protocol.sendRequest(C.MANAGER_ID, [(2L, 'PING')])
-                except Exception as e:
-                    raise Exception('STARTTLS failed. Check that manager certificates are accepted.')
-            self.mgr_host, self.mgr_port = addr.host, addr.port
             name = getattr(self, 'instanceName', self.name)
-            yield protocol.loginServer(self._getPassword(), name,
-                                       self.description, self.notes)
-            self.password = protocol.password
+            yield protocol.loginServer(name, self.description, self.notes)
             self._cxn = protocol
-            self.client = IClientAsync(protocol)
+            self.ID = protocol.ID
+            protocol.request_handler = self.request_handler
+            protocol.onDisconnect().addBoth(self._connection_lost)
+            self.client = ClientAsync(protocol)
             yield self.client._init()
             yield self._initServer()
             self.started = True
@@ -408,15 +350,10 @@ class LabradServer(ClientFactory):
             log.err("connection failed, disconnecting")
             traceback.print_exc()
             self.disconnect(e)
+            raise
 
-    def _getPassword(self):
-        if getattr(self, 'password', None) is not None:
-            pw = self.password
-        elif C.PASSWORD is not None:
-            pw = C.PASSWORD
-        else:
-            pw = getpass.getpass('Enter LabRAD password: ')
-        return pw
+    # Network events
+    # these methods are called by network events from twisted
 
     @inlineCallbacks
     def _initServer(self):
@@ -434,11 +371,11 @@ class LabradServer(ClientFactory):
                 self.addSignal(s, p)
             else:
                 self.addSetting(s, p)
+
         yield p.send()
 
         # do server-specific initialization
         yield self.initServer()
-
         # make sure we shut down gracefully when reactor quits or a remote message is fired
         self._shutdownID = reactor.addSystemEventTrigger('before', 'shutdown', self._stopServer)
         self._cxn.addListener(self._stopServer, ID=987654321)
@@ -475,11 +412,7 @@ class LabradServer(ClientFactory):
             if hasattr(self, '_shutdownID'):
                 reactor.removeSystemEventTrigger(self._shutdownID)
 
-    def clientConnectionFailed(self, connector, reason):
-        """Called when we fail to establish a network to LabRAD."""
-        self.onStartup.errback(reason)
-
-    def clientConnectionLost(self, connector, reason):
+    def _connection_lost(self, reason):
         """Called when the network connection to LabRAD is lost.
 
         This could happen either because there was an error and the
@@ -489,7 +422,7 @@ class LabradServer(ClientFactory):
         if not self.started:
             self.onStartup.errback(reason)
         else:
-            if self.stopping and reason.check(ConnectionDone):
+            if self.stopping and (reason is None or reason.check(ConnectionDone, ConnectionLost)):
                 self.onShutdown.callback()
             else:
                 self.onShutdown.errback(reason)
@@ -618,16 +551,4 @@ class LabradServer(ClientFactory):
 
     def log(self, *messages):
         self.onLog((datetime.now(), messages))
-
-
-class LabradService(internet.TCPClient):
-    def __init__(self, server):
-        internet.TCPClient.__init__(self, server.host, server.port, server)
-        self.server = server
-        self.setName(server.name)
-        self.onStartup = server.onStartup
-        self.onShutdown = server.onShutdown
-
-registerAdapter(LabradService, ILabradServer, service.IService)
-
 

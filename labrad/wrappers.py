@@ -20,13 +20,10 @@ from types import MethodType
 
 from twisted.internet import defer
 from twisted.internet.defer import inlineCallbacks, returnValue
-from twisted.python.components import registerAdapter
 
-from zope.interface import implements
-
-from labrad import constants as C, crypto, manager, protocol, types as T, util
-from labrad.interfaces import ILabradProtocol, ILabradManager, IClientAsync
-from labrad.support import indent, mangle, extractKey, MultiDict, PacketRecord, PacketResponse, getPassword, hexdump
+from labrad import constants as C, manager, protocol, types as T
+from labrad.support import (indent, mangle, extractKey, MultiDict, PacketRecord,
+                            PacketResponse, hexdump)
 
 
 class AsyncSettingWrapper(object):
@@ -46,6 +43,7 @@ class AsyncSettingWrapper(object):
         self.ID = ID
         self.__doc__, self.accepts, self.returns, self.notes = info
 
+    @inlineCallbacks
     def __call__(self, *args, **kw):
         """Send a request to this setting."""
         tag = extractKey(kw, 'tag', None) or self.accepts
@@ -54,9 +52,8 @@ class AsyncSettingWrapper(object):
         elif len(args) == 1:
             args = args[0]
         flat = T.flatten(args, tag)
-        d = self._server._send([(self.ID, flat)], **kw)
-        d.addCallback(lambda r: r[0][1])
-        return d
+        r = yield self._server._send([(self.ID, flat)], **kw)
+        returnValue(r[0][1])
 
     @inlineCallbacks
     def connect(self, handler, context=(0, 0),
@@ -132,7 +129,8 @@ class AsyncPacketWrapper(object):
                 elif len(args) == 1:
                     args = args[0]
                 flat = T.flatten(args, tag)
-                rec = PacketRecord(ID=setting.ID, data=args, tag=tag, flat=flat, key=key)
+                rec = PacketRecord(ID=setting.ID, data=args, tag=tag, flat=flat,
+                                   key=key, name=setting.name)
                 self._packet.append(rec)
                 return self
             wrapped.name = setting.name
@@ -159,13 +157,13 @@ class AsyncPacketWrapper(object):
         self._kw = kw
         self.settings = SettingBinder(self)
 
+    @inlineCallbacks
     def send(self, **kw):
         """Send this packet to the server."""
         # drop keys from records before sending
         records = [(rec.ID, rec.flat) for rec in self._packet]
-        d = self._server._send(records, **dict(self._kw, **kw))
-        d.addCallback(PacketResponse, self._server, self._packet)
-        return d
+        r = yield self._server._send(records, **dict(self._kw, **kw))
+        returnValue(PacketResponse(r, self._server, self._packet))
 
     def _bind(self, method):
         """Bind a method to this instance."""
@@ -391,86 +389,19 @@ class AsyncServerWrapper(object):
 
 @inlineCallbacks
 def getConnection(host=C.MANAGER_HOST, port=None, name="Python Client",
-                  password=None, tls=C.MANAGER_TLS):
+                  password=None, tls_mode=C.MANAGER_TLS):
     """Connect to LabRAD and return a deferred that fires the protocol object."""
-    tls = C.check_tls_mode(tls)
-    if port is None:
-        port = C.MANAGER_PORT_TLS if tls == 'on' else C.MANAGER_PORT
-
-    if tls == 'on':
-        tls_options = crypto.tls_options(host)
-        p = yield protocol.factory.connectSSL(host, port, tls_options,
-                                              timeout=C.TIMEOUT)
-    else:
-        def connect():
-            return protocol.factory.connectTCP(host, port, timeout=C.TIMEOUT)
-
-        @inlineCallbacks
-        def start_tls(p, cert_string=None):
-            try:
-                resp = yield p.sendRequest(C.MANAGER_ID, [(1L, ('STARTTLS', host))])
-            except Exception, e:
-                raise Exception(
-                    'Failed sending STARTTLS command to server. You should '
-                    'update the manager and configure it to support encryption '
-                    'or else disable encryption for clients. See '
-                    'https://github.com/labrad/pylabrad/blob/master/CONFIG.md')
-            cert = resp[0][1]
-            p.transport.startTLS(crypto.tls_options(host, cert_string=cert_string))
-            returnValue(cert)
-
-        def ping(p):
-            return p.sendRequest(C.MANAGER_ID, [(2L, 'PING')])
-
-        p = yield connect()
-        is_local_connection = util.is_local_connection(p.transport)
-        if ((tls == 'starttls-force') or
-            (tls == 'starttls' and not is_local_connection)):
-            try:
-                cert = yield start_tls(p)
-            except Exception:
-                # TODO: remove this retry. This is a temporary fix to support
-                # compatibility until TLS is fully deployed.
-                print ('STARTTLS failed; will retry without encryption in case '
-                       'we are connecting to a legacy manager.')
-                p = yield getConnection(host, port, name, password, tls='off')
-                print 'Connected without encryption.'
-                returnValue(p)
-            try:
-                yield ping(p)
-            except Exception:
-                print 'STARTTLS failed due to untrusted server certificate:'
-                print 'SHA1 Fingerprint={}'.format(crypto.fingerprint(cert))
-                print
-                while True:
-                    ans = raw_input(
-                            "Accept server certificate for host '{}'? "
-                            "(accept just this [O]nce; [S]ave and always "
-                            "accept this cert; [R]eject) ".format(host))
-                    if ans.lower() in ['o', 's', 'r']:
-                        break
-                    else:
-                        print 'Invalid input:', ans
-                if ans.lower() == 'r':
-                    raise
-                p = yield connect()
-                yield start_tls(p, cert)
-                yield ping(p)
-                if ans.lower() == 's':
-                    # save now that we know TLS succeeded,
-                    # including hostname verification.
-                    crypto.save_cert(host, cert)
-    if password is None:
-        password = getPassword()
-    yield p.loginClient(password, name)
+    p = yield protocol.connect(host, port, tls_mode)
+    yield p.authenticate(password)
+    yield p.loginClient(name)
     returnValue(p)
 
 @inlineCallbacks
 def connectAsync(host=C.MANAGER_HOST, port=None, name="Python Client",
-                 password=None, tls=C.MANAGER_TLS):
+                 password=None, tls_mode=C.MANAGER_TLS):
     """Connect to LabRAD and return a deferred that fires the client object."""
-    p = yield getConnection(host, port, name, password, tls=tls)
-    cxn = IClientAsync(p)
+    p = yield getConnection(host, port, name, password, tls_mode=tls_mode)
+    cxn = ClientAsync(p)
     yield cxn._init()
     cxn.onDisconnect = p.onDisconnect
     returnValue(cxn)
@@ -488,8 +419,6 @@ def runAsync(func, *args, **kw):
 
 class ClientAsync(object):
     """Adapt a LabRAD request protocol object to an asynchronous client."""
-
-    implements(IClientAsync)
 
     def __init__(self, prot):
         self.servers = MultiDict()
@@ -642,10 +571,8 @@ class ClientAsync(object):
     def _removeListener(self):
         return self._cxn.removeListener
 
-registerAdapter(ClientAsync, ILabradProtocol, IClientAsync)
-
+@inlineCallbacks
 def wrapAsync(cls, *args, **kw):
     obj = cls(*args, **kw)
-    d = obj.refresh()
-    d.addCallback(lambda _: obj)
-    return d
+    yield obj.refresh()
+    returnValue(obj)
